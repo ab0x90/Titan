@@ -1500,25 +1500,17 @@ def _dump_rdcman(rdcman_files: dict, masterkeys: dict, out: list):
 def _parse_credman_struct(data: bytes) -> dict:
     """Parse a decrypted Windows CREDENTIAL binary structure."""
     try:
-        pos = 0
-        ordered = []
-        while pos < len(data) - 1:
-            lo, hi = data[pos], data[pos + 1]
-            if 0x20 <= lo <= 0x7e and hi == 0:
-                start = pos
-                chars = []
-                while pos < len(data) - 1 and 0x20 <= data[pos] <= 0x7e and data[pos + 1] == 0:
-                    chars.append(chr(data[pos]))
-                    pos += 2
-                if len(chars) >= 2:
-                    ordered.append((start, ''.join(chars)))
-            else:
-                pos += 1
-        if not ordered:
-            return None
-        target   = ordered[0][1] if len(ordered) > 0 else ''
-        username = ordered[1][1] if len(ordered) > 1 else ''
-        secret   = ordered[2][1] if len(ordered) > 2 else '[binary]'
+        from impacket.dpapi import CREDENTIAL_BLOB
+        cred = CREDENTIAL_BLOB(data)
+        target = cred['Target'].decode('utf-16le').rstrip('\x00')
+        username = cred['Username'].decode('utf-16le').rstrip('\x00')
+        secret_raw = cred['Unknown3']
+        try:
+            secret = secret_raw.decode('utf-16le').rstrip('\x00')
+        except UnicodeDecodeError:
+            secret = secret_raw.decode('latin-1')
+        if not secret:
+            secret = '[empty]'
         return {'target': target, 'username': username, 'secret': secret}
     except Exception:
         return None
@@ -1534,10 +1526,9 @@ def _credman_blob_decrypt(raw: bytes, masterkeys: dict):
 
 def _is_internal_token(cred: dict) -> bool:
     target = cred.get('target', '')
-    user   = cred.get('username', '')
-    if 'virtualapp/didlogical' in target and user == 'PersistedCredential':
+    if 'virtualapp/didlogical' in target:
         return True
-    if not target and not user:
+    if not target and not cred.get('username', ''):
         return True
     return False
 
