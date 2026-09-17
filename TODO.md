@@ -1,3 +1,54 @@
+# --kerb: Kerberos ticket dump — TODO
+
+## Goal
+
+Add a `--kerb` flag to `titan dump` that dumps all Kerberos tickets cached on
+the remote host to a local `.ccache` file, mirroring what
+[klist2ccache](https://github.com/jakeotte/klist2ccache) does but using Titanis
+binaries only (no impacket).  Primary target: TGTs left in LSASS from
+interactive/RDP sessions — e.g. a domain admin who RDP'd in and logged out but
+whose ticket is still cached.
+
+## Approach
+
+Use `Tsch` (MS-TSCH over SMB named pipe, port 445) instead of WMI (DCOM) for
+remote command execution — Tsch avoids the Kerberos SPN failure that WMI/DCOM
+hits when targeting by IP address (`RPCSS/<ip>` doesn't exist as an SPN).
+
+1. `Tsch create/run` → `klist sessions` → capture output → pull via `Smb2Client`
+2. Parse session list with regex; keep only `Kerberos:*` auth sessions (NTLM/Negotiate have no tickets)
+3. Per LUID: `Tsch create/run` → `klist tickets /export -lh <H> -li <L>` in a per-LUID subdir
+4. `Smb2Client get` → pull all `.kirbi` files
+5. `Kerb select -From <files> -Into {host}_tickets.ccache -Overwrite`
+6. `Tsch delete` all tasks + `rmdir` remote temp tree
+
+## Known issues to resolve
+
+### `klist tickets /export` not supported on all Windows versions
+`klist.exe` on Windows Server 2019 build 17763 does not recognise `/export`.
+The abbreviated help shows only `[tickets]` and `sessions` — no `/export` flag.
+**Fix to investigate**: `klist tickets /export` was added in later Server 2019
+cumulative updates and Windows 10 1903+.  Possible fallback: use `klist tgt
+-lh <H> -li <L>` to get TGT data as text (hex dump), then parse it into ccache
+format directly in Python (the klist2ccache approach — no impacket needed, just
+struct/bytes).
+
+### klist -li requires signed decimal, not hex, for values > 0x7fffffff
+Windows `klist` parses `-li` as a signed 32-bit integer.  LUIDs with the high
+bit set (e.g. `0xcf48b94b`) must be passed as their signed decimal equivalent
+(`ctypes.c_int32(int(luid, 16)).value`) or klist silently clamps to
+`0x7fffffff` and targets the wrong session.  **This is already worked out.**
+
+### Network logon sessions are transient
+`Kerberos:Network` sessions in `klist sessions` are created per-connection and
+terminated when the connection closes.  They are typically gone before we can
+enumerate and export.  The valuable targets are interactive/RDP sessions
+(`Kerberos:Interactive` or `Kerberos:RemoteInteractive`) — those persist in
+LSASS even after the user logs out.  Test against a machine where a domain
+admin has RDP'd in, not a server with only service connections.
+
+---
+
 # Proxychains / ntlmrelayx --socks relay support — TODO
 
 ## Goal
