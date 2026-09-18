@@ -6,7 +6,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 WRAPPER="${BIN_DIR}/titan"
 
-TITANIS_DOWNLOAD_URL="https://github.com/trustedsec/Titanis/releases/download/v0.9.262/Titanis-tools-linux-x64-net8.zip"
+TITANIS_DOWNLOAD_URL="https://github.com/mattmillen15/Titanis/releases/download/v0.9.262-tsch/Titanis-tools-linux-x64-net8.zip"
 TITANIS_INSTALL_DIR="${HOME}/tools/titanis"
 
 # ── .NET 8 runtime ────────────────────────────────────────────────────────────

